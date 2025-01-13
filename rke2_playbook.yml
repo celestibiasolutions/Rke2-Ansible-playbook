@@ -1,0 +1,410 @@
+---
+- name: Prepare all nodes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Update hosts file
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item]['ansible_default_ipv4']['address'] }} {{ item }}"
+      loop: "{{ groups['all'] }}"
+
+- name: Install RKE2 on Master Nodes
+  hosts: master
+  become: yes
+  vars:
+    rke2_version: v1.24.10+rke2r1
+  tasks:
+    - name: Download RKE2 installation script
+      get_url:
+        url: https://get.rke2.io
+        dest: /tmp/rke2-install.sh
+        mode: '0755'
+
+    - name: Install RKE2 server
+      command: /tmp/rke2-install.sh
+      environment:
+        INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+        INSTALL_RKE2_TYPE: server
+      async: 600
+      poll: 0
+      register: rke2_server_install
+
+    - name: Check RKE2 server installation status
+      async_status:
+        jid: "{{ rke2_server_install.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: 30
+      delay: 10
+
+    - name: Enable and start RKE2 server service
+      systemd:
+        name: rke2-server
+        enabled: yes
+        state: started
+      async: 300
+      poll: 5
+
+    - name: Wait for node-token file
+      wait_for:
+        path: /var/lib/rancher/rke2/server/node-token
+        timeout: 300
+
+    - name: Read node-token
+      slurp:
+        src: /var/lib/rancher/rke2/server/node-token
+      register: node_token
+
+    - name: Set fact for node token 
+      set_fact:
+        rke2_node_token: "{{ node_token['content'] | b64decode | trim }}"
+
+    - name: Install kubectl
+      get_url:
+        url: "https://dl.k8s.io/release/{{ lookup('url', 'https://dl.k8s.io/release/stable.txt') }}/bin/linux/amd64/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: '0755'
+
+    - name: Set KUBECONFIG environment variable
+      lineinfile:
+        path: /etc/environment
+        line: 'KUBECONFIG=/etc/rancher/rke2/rke2.yaml'
+        create: yes
+
+- name: Install RKE2 on Worker Nodes
+  hosts: worker
+  become: yes
+  vars:
+    rke2_version: v1.24.10+rke2r1
+    master_ip: "{{ hostvars[groups['master'][0]]['ansible_default_ipv4']['address'] }}"
+  tasks:
+    - name: Check network connectivity to master
+      wait_for:
+        host: "{{ master_ip }}"
+        port: 9345
+        timeout: 60
+      register: port_check
+      ignore_errors: yes
+
+    - name: Display port check result
+      debug:
+        var: port_check
+
+    - name: Fail if port is not reachable
+      fail:
+        msg: "Cannot reach master node on port 9345. Please check network connectivity and firewall rules."
+      when: port_check.failed
+
+    - name: Download RKE2 installation script
+      get_url:
+        url: https://get.rke2.io
+        dest: /tmp/rke2-install.sh
+        mode: '0755'
+
+    - name: Create RKE2 config directory
+      file:
+        path: /etc/rancher/rke2
+        state: directory
+        mode: '0755'
+
+    - name: Configure RKE2 agent
+      copy:
+        content: |
+          server: https://{{ master_ip }}:9345
+          token: {{ hostvars[groups['master'][0]]['rke2_node_token'] }}
+        dest: /etc/rancher/rke2/config.yaml
+
+    - name: Install RKE2 agent
+      command: /tmp/rke2-install.sh
+      environment:
+        INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+        INSTALL_RKE2_TYPE: agent
+      async: 600
+      poll: 0
+      register: rke2_agent_install
+
+    - name: Check RKE2 agent installation status
+      async_status:
+        jid: "{{ rke2_agent_install.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: 30
+      delay: 10
+
+    - name: Enable and start RKE2 agent service
+      systemd:
+        name: rke2-agent
+        enabled: yes
+        state: started
+      async: 300
+      poll: 5
+
+    - name: Wait for RKE2 agent to join the cluster
+      wait_for:
+        path: /var/lib/rancher/rke2/agent/kubelet.kubeconfig
+        timeout: 600
+      register: join_result
+      ignore_errors: yes
+
+    - name: Check RKE2 agent logs if join failed
+      command: journalctl -u rke2-agent -n 100
+      register: rke2_agent_logs
+      when: join_result.failed
+
+    - name: Display RKE2 agent logs
+      debug:
+        var: rke2_agent_logs.stdout_lines
+      when: join_result.failed
+
+    - name: Install kubectl
+      get_url:
+        url: "https://dl.k8s.io/release/{{ lookup('url', 'https://dl.k8s.io/release/stable.txt') }}/bin/linux/amd64/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: '0755'
+
+- name: Verify cluster status
+  hosts: master
+  become: yes
+  tasks:
+    - name: Wait for nodes to be ready
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      register: kubectl_output
+      until: kubectl_output.stdout.find("Ready") != -1
+      retries: 30
+      delay: 20
+      ignore_errors: yes
+
+    - name: Display cluster nodes
+      debug:
+        var: kubectl_output.stdout_lines
+
+    - name: Check RKE2 server logs if nodes are not ready
+      command: journalctl -u rke2-server -n 100
+      register: rke2_server_logs
+      when: kubectl_output.failed
+
+    - name: Display RKE2 server logs
+      debug:
+        var: rke2_server_logs.stdout_lines
+      when: kubectl_output.failed
+
+- name: Final check
+  hosts: all
+  become: yes
+  tasks:
+    - name: Check RKE2 service status
+      command: systemctl is-active rke2-{{ 'server' if inventory_hostname in groups['master'] else 'agent' }}
+      register: rke2_status
+      ignore_errors: yes
+
+    - name: Display RKE2 service status
+      debug:
+        var: rke2_status.stdout
+
+    - name: Fail if RKE2 service is not active
+      fail:
+        msg: "RKE2 service is not active on {{ inventory_hostname }}"
+      when: rke2_status.stdout != "active"
+# ---
+# - name: Install RKE2 on Master Node
+#   hosts: master
+#   become: yes
+#   vars:
+#     rke2_version: v1.24.10+rke2r1
+#   tasks:
+#     - name: Download RKE2 installation script
+#       get_url:
+#         url: https://get.rke2.io
+#         dest: /tmp/rke2-install.sh
+#         mode: '0755'
+
+#     - name: Install RKE2 server
+#       command: /tmp/rke2-install.sh
+#       environment:
+#         INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+#         INSTALL_RKE2_TYPE: server
+#       async: 600
+#       poll: 0
+#       register: rke2_server_install
+
+#     - name: Check RKE2 server installation status
+#       async_status:
+#         jid: "{{ rke2_server_install.ansible_job_id }}"
+#       register: job_result
+#       until: job_result.finished
+#       retries: 30
+#       delay: 10
+
+#     - name: Enable and start RKE2 server service
+#       systemd:
+#         name: rke2-server
+#         enabled: yes
+#         state: started
+#       async: 300
+#       poll: 5
+
+#     - name: Wait for node-token file
+#       wait_for:
+#         path: /var/lib/rancher/rke2/server/node-token
+#         timeout: 300
+
+#     - name: Read node-token
+#       slurp:
+#         src: /var/lib/rancher/rke2/server/node-token
+#       register: node_token
+
+#     - name: Set fact for node token
+#       set_fact:
+#         rke2_node_token: "{{ node_token['content'] | b64decode | trim }}"
+
+#     - name: Install kubectl
+#       get_url:
+#         url: "https://dl.k8s.io/release/{{ lookup('url', 'https://dl.k8s.io/release/stable.txt') }}/bin/linux/amd64/kubectl"
+#         dest: /usr/local/bin/kubectl
+#         mode: '0755'
+
+#     - name: Set KUBECONFIG environment variable
+#       lineinfile:
+#         path: /etc/environment
+#         line: 'KUBECONFIG=/etc/rancher/rke2/rke2.yaml'
+#         create: yes
+
+# - name: Install RKE2 on Worker Node
+#   hosts: worker
+#   become: yes
+#   vars:
+#     rke2_version: v1.24.10+rke2r1
+#     master_ip: "{{ hostvars[groups['master'][0]]['ansible_host'] }}"
+#   tasks:
+#     - name: Check network connectivity to master
+#       wait_for:
+#         host: "{{ master_ip }}"
+#         port: 9345
+#         timeout: 60
+#       register: port_check
+#       ignore_errors: yes
+
+#     - name: Display port check result
+#       debug:
+#         var: port_check
+
+#     - name: Fail if port is not reachable
+#       fail:
+#         msg: "Cannot reach master node on port 9345. Please check network connectivity and firewall rules."
+#       when: port_check.failed
+
+#     - name: Download RKE2 installation script
+#       get_url:
+#         url: https://get.rke2.io
+#         dest: /tmp/rke2-install.sh
+#         mode: '0755'
+
+#     - name: Create RKE2 config directory
+#       file:
+#         path: /etc/rancher/rke2
+#         state: directory
+#         mode: '0755'
+
+#     - name: Configure RKE2 agent
+#       copy:
+#         content: |
+#           server: https://{{ master_ip }}:9345
+#           token: {{ hostvars[groups['master'][0]]['rke2_node_token'] }}
+#         dest: /etc/rancher/rke2/config.yaml
+
+#     - name: Install RKE2 agent
+#       command: /tmp/rke2-install.sh
+#       environment:
+#         INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+#         INSTALL_RKE2_TYPE: agent
+#       async: 600
+#       poll: 0
+#       register: rke2_agent_install
+
+#     - name: Check RKE2 agent installation status
+#       async_status:
+#         jid: "{{ rke2_agent_install.ansible_job_id }}"
+#       register: job_result
+#       until: job_result.finished
+#       retries: 30
+#       delay: 10
+
+#     - name: Enable and start RKE2 agent service
+#       systemd:
+#         name: rke2-agent
+#         enabled: yes
+#         state: started
+#       async: 300
+#       poll: 5
+
+#     - name: Wait for RKE2 agent to join the cluster
+#       wait_for:
+#         path: /var/lib/rancher/rke2/agent/kubelet.kubeconfig
+#         timeout: 600
+#       register: join_result
+#       ignore_errors: yes
+
+#     - name: Check RKE2 agent logs if join failed
+#       command: journalctl -u rke2-agent -n 100
+#       register: rke2_agent_logs
+#       when: join_result.failed
+
+#     - name: Display RKE2 agent logs
+#       debug:
+#         var: rke2_agent_logs.stdout_lines
+#       when: join_result.failed
+
+#     - name: Install kubectl
+#       get_url:
+#         url: "https://dl.k8s.io/release/{{ lookup('url', 'https://dl.k8s.io/release/stable.txt') }}/bin/linux/amd64/kubectl"
+#         dest: /usr/local/bin/kubectl
+#         mode: '0755'
+
+# - name: Verify cluster status
+#   hosts: master
+#   become: yes
+#   tasks:
+#     - name: Wait for nodes to be ready
+#       command: kubectl get nodes
+#       environment:
+#         KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+#       register: kubectl_output
+#       until: kubectl_output.stdout.find("Ready") != -1
+#       retries: 30
+#       delay: 20
+#       ignore_errors: yes
+
+#     - name: Display cluster nodes
+#       debug:
+#         var: kubectl_output.stdout_lines
+
+#     - name: Check RKE2 server logs if nodes are not ready
+#       command: journalctl -u rke2-server -n 100
+#       register: rke2_server_logs
+#       when: kubectl_output.failed
+
+#     - name: Display RKE2 server logs
+#       debug:
+#         var: rke2_server_logs.stdout_lines
+#       when: kubectl_output.failed
+
+# - name: Final check
+#   hosts: all
+#   become: yes
+#   tasks:
+#     - name: Check RKE2 service status
+#       command: systemctl is-active rke2-{{ 'server' if inventory_hostname in groups['master'] else 'agent' }}
+#       register: rke2_status
+#       ignore_errors: yes
+
+#     - name: Display RKE2 service status
+#       debug:
+#         var: rke2_status.stdout
+
+#     - name: Fail if RKE2 service is not active
+#       fail:
+#         msg: "RKE2 service is not active on {{ inventory_hostname }}"
+#       when: rke2_status.stdout != "active"
